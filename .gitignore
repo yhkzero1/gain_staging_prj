@@ -1,0 +1,21 @@
+# Audio files
+*.wav
+*.mp3
+*.aiff
+*.flac
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Studio One backups
+*.song.bak
+
+# Claude memory
+.claude/
