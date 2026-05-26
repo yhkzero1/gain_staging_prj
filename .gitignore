@@ -6,7 +6,8 @@
 
 # PyInstaller
 build/
-dist/
+dist/*
+!dist/GainStagingCalc.exe
 *.spec
 
 # Python
