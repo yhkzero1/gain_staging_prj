@@ -94,7 +94,7 @@ pyinstaller GainStagingCalc.spec
 | Valid (s) | 노이즈 게이트 통과 구간 |
 | Level (dBFS) | 측정된 트랙 레벨 |
 | Offset (dB) | 필요 게인 조정량 |
-| New Gain | 적용 후 InputFX 게인 값 |
+| New Gain | WAV 분석 기준 InputFX에 설정할 절대 게인 값 |
 | Status | OK / Peak Clip Risk / No Signal |
 
 **Peak Clip Risk** (주황): 해당 오프셋 적용 시 피크 클리핑 발생 가능.
@@ -129,3 +129,4 @@ gain_staging_prj/
 - **Write to .song 실행 전 Studio One을 반드시 닫을 것.** 열린 상태에서 쓰면 파일이 손상될 수 있음.
 - 백업(`.song.bak`)은 같은 디렉터리에 생성됨. 문제 발생 시 `.bak`을 `.song`으로 복사해 복원.
 - Studio One 트랙과 WAV 파일은 **파일명 stem** 으로 매칭됨 (대소문자 구분).
+- **New Gain은 항상 WAV 분석 기준 절대값이다.** `.song` 파일에 이미 설정된 기존 게인 값과 무관하게, 측정된 레벨과 타깃만으로 계산된다. Write to .song을 반복 실행해도 값이 누적되지 않음.

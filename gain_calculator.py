@@ -634,9 +634,8 @@ class App(tk.Tk):
         gate_str = f"{r['gate_used']:.1f}"   if "gate_used" in r else "—"
 
         if self._song_tracks and r.get("label") and r["status"] != "No Signal":
-            cur_db   = self._song_tracks.get(r["label"], {}).get("current_inputfx_gain_db", 0.0)
-            new_db   = cur_db + r["offset_db"]
-            gain_str = f"{new_db:+.2f} dB"
+            # WAV 분석값만 사용 — 기존 .song gain 누적 금지
+            gain_str = f"{r['offset_db']:+.2f} dB"
         else:
             gain_str = "—"
 
@@ -672,8 +671,8 @@ class App(tk.Tk):
             label = r.get("label")
             if not label:
                 continue
-            cur_db = self._song_tracks.get(label, {}).get("current_inputfx_gain_db", 0.0)
-            gain_map[label] = cur_db + r["offset_db"]
+            # WAV 분석값만 사용 — 기존 .song gain 누적 금지
+            gain_map[label] = r["offset_db"]
 
         if not gain_map:
             messagebox.showinfo("없음", "적용할 트랙이 없습니다.")
