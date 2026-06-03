@@ -9,6 +9,7 @@ build/
 dist/*
 !dist/GainStagingCalc.exe
 *.spec
+GainStagingCalc.exe
 
 # Python
 __pycache__/

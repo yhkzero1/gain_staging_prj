@@ -18,14 +18,24 @@ Track type detection
 --------------------
 파일명이 아닌 오디오 특성 (크레스트 팩터, 스펙트럴 센트로이드, 저주파 비율, 트랜지언트 레이트)
 으로 트랙 종류를 자동 추론한다. 결과 테이블에 표시 용도. 타깃 dBFS에는 영향 없음.
-모든 트랙의 목표 레벨은 동일하게 사용자가 설정한 Target (기본 −18 dBFS, 0 VU).
+모든 트랙의 목표 레벨은 동일하게 사용자가 설정한 Target (기본 -18 dBFS, 0 VU).
+
+Gate
+----
+2-pass Otsu: 1차로 무음/신호 경계, 2차로 신호 구간 안에서 bleed/hit 경계를 자동 탐색.
+OH/심벌/탐처럼 bleed와 실제 어택 사이에 명확한 gap이 있는 트랙에서 bleed를 자동 배제.
+
+Peak-cap
+--------
+VU 기준 게인이 피크를 Peak Headroom 이상으로 올리면 게인을 자동으로 제한한다.
+해당 트랙은 Status = "Peak-capped" 로 표시.
 
 Studio One integration
 ----------------------
 .song 파일(ZIP)의 audiomixer.xml에서 트랙 목록과 현재 gain을 읽어,
 분석 결과를 직접 적용한다. 적용 전 자동으로 .song.bak 백업 생성.
 
-Dependencies: numpy, soundfile, scipy  (pip install numpy soundfile scipy)
+Dependencies: numpy, soundfile  (pip install numpy soundfile)
 """
 
 from __future__ import annotations
@@ -46,35 +56,31 @@ from tkinter import ttk, filedialog, messagebox
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-VU_TAU_MS       = 300    # ms — noise gate block size
-HOLD_BLOCKS     = 2      # gate hold (blocks)
-MIN_VALID_MS    = 600    # minimum valid duration
-DEFAULT_GATE_DB = -50.0  # dBFS  (auto gate 비활성 시 사용)
-DEFAULT_TARGET  = -18.0  # dBFS  (0 VU, EBU R68)
-DEFAULT_PCT     = 99     # percentile — VU Needle Hold ~2000 ms 기준
+VU_TAU_MS        = 300    # ms — noise gate block size
+HOLD_BLOCKS      = 2      # gate hold (blocks)
+MIN_VALID_MS     = 600    # minimum valid duration
+DEFAULT_GATE_DB  = -50.0  # dBFS  (auto gate 비활성 시 사용)
+DEFAULT_TARGET   = -18.0  # dBFS  (0 VU, EBU R68)
+DEFAULT_PCT      = 99     # percentile — VU Needle Hold ~2000 ms 기준
+DEFAULT_HEADROOM = -1.0   # dBFS  (peak-cap 헤드룸; 피크가 이 값을 넘지 않도록 게인 제한)
 
 
-def _auto_gate_threshold(block_rms_db: np.ndarray) -> float:
-    """
-    Otsu's method로 블록 RMS 분포에서 무음/신호 경계를 자동 탐색.
-
-    원리: 전체 블록을 두 그룹(무음·신호)으로 나눌 때
-    그룹 간 분산을 최대화하는 임계값을 반환.
-    드럼처럼 명확한 이봉 분포, 베이스처럼 연속 분포 모두 잘 작동.
-    결과는 [-70, -15] dBFS 로 클리핑.
-    """
-    vals            = np.clip(block_rms_db, -90.0, 0.0)
-    bins            = np.arange(-90.0, 0.51, 0.5)
-    hist, edges     = np.histogram(vals, bins=bins)
-    centers         = (edges[:-1] + edges[1:]) / 2.0
-    total           = float(hist.sum())
+def _otsu_1d(vals: np.ndarray, lo: float, hi: float) -> float:
+    """Otsu's method: 두 그룹 간 분산을 최대화하는 임계값 반환."""
+    step = 0.5
+    bins = np.arange(lo, hi + step, step)
+    if len(bins) < 3:
+        return lo
+    hist, edges = np.histogram(vals, bins=bins)
+    centers     = (edges[:-1] + edges[1:]) / 2.0
+    total       = float(hist.sum())
     if total < 2:
-        return DEFAULT_GATE_DB
+        return lo
 
-    cum      = np.cumsum(hist).astype(float)
-    cum_sum  = np.cumsum(hist * centers)
+    cum     = np.cumsum(hist).astype(float)
+    cum_sum = np.cumsum(hist * centers)
 
-    best_thresh = DEFAULT_GATE_DB
+    best_thresh = lo
     best_var    = -1.0
     for i in range(1, len(centers)):
         w0 = cum[i - 1] / total
@@ -87,8 +93,38 @@ def _auto_gate_threshold(block_rms_db: np.ndarray) -> float:
         if var_b > best_var:
             best_var    = var_b
             best_thresh = float(centers[i])
+    return best_thresh
 
-    return float(np.clip(best_thresh, -70.0, -15.0))
+
+def _auto_gate_threshold(block_rms_db: np.ndarray) -> float:
+    """
+    2-pass Otsu gate threshold.
+
+    1차: 전체 범위에서 무음/신호 경계 탐색 (T1).
+    2차: 신호 구간(>= T1) 안에서 bleed/hit 경계 재탐색 (T2).
+         OH/심벌/탐처럼 bleed와 실제 어택 사이에 명확한 gap이 있는 트랙에서
+         bleed 구간을 자동으로 배제한다.
+         gap < 5 dB 이거나 어느 한쪽 그룹이 5블록 미만이면 T1 사용.
+
+    결과는 [-70, -15] dBFS 로 클리핑.
+    """
+    vals = np.clip(block_rms_db, -90.0, 0.0)
+
+    # 1차: 무음 vs. 신호
+    t1 = float(np.clip(_otsu_1d(vals, -90.0, 0.0), -70.0, -15.0))
+
+    # 2차: 신호 구간 안에서 bleed vs. hit
+    signal = vals[vals >= t1]
+    if len(signal) >= 10:
+        t2_raw  = _otsu_1d(signal, float(t1), 0.0)
+        t2      = float(np.clip(t2_raw, -70.0, -15.0))
+        gap     = t2 - t1
+        n_bleed = int(np.sum((signal >= t1) & (signal < t2)))
+        n_hit   = int(np.sum(signal >= t2))
+        if gap >= 5.0 and n_bleed >= 5 and n_hit >= 5:
+            return t2
+
+    return t1
 
 
 # ── Track type detection (audio-based) ─────────────────────────────────────────
@@ -102,7 +138,10 @@ TYPE_LABEL: dict[str, str] = {
 def _audio_features(mono: np.ndarray, sr: int) -> dict:
     """
     크레스트 팩터 · 스펙트럴 센트로이드 · 저주파 비율 · 트랜지언트 레이트 계산.
-    처음 2초만 사용해 속도 확보.
+
+    스펙트럴 특성: 전체 트랙을 4등분 후 가장 큰 2초 구간 사용.
+    (첫 구간에 무음이 길어 오분류되는 트랙 방지)
+    트랜지언트 레이트: 전체 트랙 기준.
     """
     rms      = float(np.sqrt(np.mean(mono ** 2)))
     peak     = float(np.max(np.abs(mono)))
@@ -115,9 +154,8 @@ def _audio_features(mono: np.ndarray, sr: int) -> dict:
     total  = max(float(mag.sum()), 1e-10)
 
     spectral_centroid = float((freqs * mag).sum() / total)
-    lf_ratio          = float(mag[freqs < 200].sum() / total)   # 200 Hz 이하 에너지 비율
+    lf_ratio          = float(mag[freqs < 200].sum() / total)
 
-    # 10 ms 블록 RMS 기준 급상승 횟수 / 초
     block = max(1, int(sr * 0.01))
     nb    = len(mono) // block
     if nb > 1:
@@ -140,43 +178,50 @@ def _audio_features(mono: np.ndarray, sr: int) -> dict:
 
 def infer_track_type(feats: dict, n_ch: int) -> str:
     """
-    오디오 특성 수치로 트랙 종류 추론.
-    표시 목적이며 분석 파라미터(타깃·게이트)에는 영향 없음.
+    오디오 특성으로 트랙 종류 추론. 표시 목적이며 게인 계산에는 영향 없음.
 
-    판별 기준 (휴리스틱):
-      crest_db > 15  → 드럼성 트랜지언트
-      crest_db < 10  → 지속음 (베이스·기타·보컬)
-      lf_ratio > 0.35 → 저주파 중심 (킥·베이스)
-      spectral_centroid > 3000 Hz → 고주파 중심 (심벌·오버헤드·하이햇)
-      transient_rate > 8 /s → 밀도 높은 트랜지언트 (하이햇)
+    임계값 설계 근거:
+      drum_like  cf > 17  — cf 15-17 대는 vocal/guitar (cf<17) 와 drum (cf>17) 경계
+      lf_bass    lf > 0.25 + cf < 15  — bass (lf 0.27-0.30, cf 13-14)
+      lf_kick    lf > 0.28 + drum_like — kick (lf 0.31+)
+      Tom        tr < 0.7  — 탐은 히트 빈도가 매우 낮음
+      Snare      tr > 4  or (tr > 1 and sc > 5000)  — 스네어 바텀/탑 구분
+      Cymbal     sc > 2500  — 라이드/심벌 고주파
+      Overhead   나머지 타악기 (OH, HH 포함)
     """
     cf = feats["crest_db"]
     sc = feats["spectral_centroid_hz"]
     lf = feats["lf_ratio"]
     tr = feats["transient_rate"]
 
-    drum_like = cf > 15
-    sustained = cf < 10
-    high_freq = sc > 3000
-    low_freq  = lf > 0.35
+    drum_like = cf > 17
 
-    if low_freq and sustained:
+    # Bass: 저주파 중심 + 타격성 낮음
+    if lf > 0.25 and cf < 15:
         return "Bass"
-    if low_freq and drum_like:
+
+    # Kick: 저주파 지배 + 타격성
+    if lf > 0.28 and drum_like:
         return "Kick"
-    if drum_like and high_freq:
-        if tr > 8:
-            return "HiHat"
-        return "Overhead" if n_ch >= 2 else "Cymbal"
-    if drum_like and sc > 800:
-        return "Snare"
-    if drum_like:
+
+    # 지속음 (Guitar / Vocal)
+    if not drum_like:
+        if sc > 4000:
+            return "Vocal"
+        if sc > 1000:
+            return "Guitar"
+        return "Other"
+
+    # 타악기 (drum_like, lf <= 0.28)
+    if tr < 0.7:                          # 히트 빈도 매우 낮음 → Tom
         return "Tom"
-    if sustained and sc > 1500:
-        return "Guitar"
-    if sustained:
-        return "Vocal"
-    return "Other"
+    if tr > 8:                            # 빠른 반복 → HiHat
+        return "HiHat"
+    if tr > 4 or (tr > 1.0 and sc > 5000):  # 중간-높은 tr, 또는 매우 밝은 타악기 → Snare
+        return "Snare"
+    if sc > 2500:                         # 밝은 심벌류 → Cymbal
+        return "Cymbal"
+    return "Overhead"                     # OH / HH (저-중 sc, 낮은 tr)
 
 
 # ── Core analysis ──────────────────────────────────────────────────────────────
@@ -190,16 +235,7 @@ def analyze_file(
     """
     WAV 파일을 읽고 VU 레벨을 분석한다.
 
-    스테레오 처리:
-      - 채널 간 상관계수로 Mono / Dual Mono / Stereo 판별
-      - 스테레오는 RMS 기준 더 큰 채널만 사용 (한쪽 무음 트랙 오측 방지)
-
-    트랙 타입:
-      - 오디오 특성으로 자동 추론, 결과에 포함 (타깃에는 영향 없음)
-
-    Auto Gate:
-      - True: Otsu's method로 트랙별 무음/신호 경계 자동 탐색
-      - False: gate_thresh_db 값 그대로 사용
+    반환값에 peak_db 포함 — peak-cap 계산에 사용.
     """
     name = Path(filepath).name
     try:
@@ -246,7 +282,6 @@ def analyze_file(
     block_power  = np.mean(blocks ** 2, axis=1)
     block_rms_db = 10.0 * np.log10(np.maximum(block_power, 1e-10))
 
-    # Auto Gate: 트랙별 분포에서 무음/신호 경계 자동 탐색
     if auto_gate:
         gate_thresh_db = _auto_gate_threshold(block_rms_db)
 
@@ -273,6 +308,7 @@ def analyze_file(
         "duration":       total_dur,
         "valid_duration": valid_dur,
         "level_db":       level_db,
+        "peak_db":        peak_db,
         "offset_db":      offset_db,
         "status":         "Peak Clip Risk" if warning else "OK",
         "warning":        warning,
@@ -286,7 +322,8 @@ def _no_signal(
     return {
         "file": name, "track_type": track_type, "stereo_info": stereo_info,
         "duration": total_dur, "valid_duration": valid_dur,
-        "level_db": None, "offset_db": 0.0, "status": "No Signal", "warning": False,
+        "level_db": None, "peak_db": None, "offset_db": 0.0,
+        "status": "No Signal", "warning": False,
     }
 
 
@@ -314,11 +351,92 @@ def parse_song_file(song_path: str) -> dict:
                 "wav_path":                None,
             }
 
+    def _strip_prefix(lbl: str) -> str:
+        return re.sub(r'^\d+\s*-?\s*', '', lbl).lower()
+
+    def _strip_prefix_suffix(lbl: str) -> str:
+        core = re.sub(r'^\d+\s*-?\s*', '', lbl)
+        return re.sub(r'\s+\d+$', '', core).lower()
+
+    unmatched   = set(tracks.keys())
+    label_order = list(tracks.keys())
+
+    def _trailing_num(s: str) -> str | None:
+        m = re.search(r'\s+(\d+)$', s)
+        return m.group(1) if m else None
+
+    def _find_match_prefix(stem_lower: str) -> str | None:
+        norm_stem = _strip_prefix(stem_lower)
+        for lbl in label_order:
+            if lbl in unmatched and _strip_prefix(lbl) == norm_stem:
+                return lbl
+        return None
+
+    def _find_match_prefix_suffix(stem_lower: str) -> str | None:
+        stem_core = _strip_prefix(stem_lower)
+        stem_num  = _trailing_num(stem_core)
+        norm_stem = re.sub(r'\s+\d+$', '', stem_core)
+        for lbl in label_order:
+            if lbl not in unmatched:
+                continue
+            lbl_core = _strip_prefix(lbl)
+            lbl_num  = _trailing_num(lbl_core)
+            lbl_base = re.sub(r'\s+\d+$', '', lbl_core)
+            if lbl_base != norm_stem:
+                continue
+            if stem_num and lbl_num and stem_num != lbl_num:
+                continue
+            return lbl
+        return None
+
     for url in re.findall(r'url="file:///([^"]+\.(?:wav|WAV))"', pool_xml):
-        decoded = urllib.parse.unquote(url).replace("/", os.sep)
-        stem    = Path(decoded).stem
-        if stem in tracks:
+        decoded    = urllib.parse.unquote(url).replace("/", os.sep)
+        stem       = Path(decoded).stem
+        stem_lower = stem.lower()
+
+        if stem in unmatched:
             tracks[stem]["wav_path"] = decoded
+            unmatched.discard(stem)
+            continue
+
+        matched = _find_match_prefix(stem_lower)
+        if not matched:
+            matched = _find_match_prefix_suffix(stem_lower)
+        if matched:
+            tracks[matched]["wav_path"] = decoded
+            unmatched.discard(matched)
+
+    for label, v in tracks.items():
+        if v["wav_path"] and not Path(v["wav_path"]).exists():
+            v["wav_path"] = None
+            unmatched.add(label)
+
+    if unmatched:
+        wav_dirs = {
+            Path(v["wav_path"]).parent
+            for v in tracks.values()
+            if v["wav_path"] and Path(v["wav_path"]).exists()
+        }
+        assigned = {v["wav_path"] for v in tracks.values() if v["wav_path"]}
+
+        for wav_dir in wav_dirs:
+            for wav_file in sorted(wav_dir.glob("*.wav")):
+                decoded = str(wav_file)
+                if decoded in assigned:
+                    continue
+                stem_lower = wav_file.stem.lower()
+
+                if wav_file.stem in unmatched:
+                    matched = wav_file.stem
+                else:
+                    matched = _find_match_prefix(stem_lower)
+                    if not matched:
+                        matched = _find_match_prefix_suffix(stem_lower)
+
+                if matched:
+                    tracks[matched]["wav_path"] = decoded
+                    unmatched.discard(matched)
+                    assigned.add(decoded)
 
     return tracks
 
@@ -333,8 +451,8 @@ def apply_gains_to_song(song_path: str, gain_map: dict[str, float]) -> str:
     backup = song_path + ".bak"
     shutil.copy2(song_path, backup)
 
-    files: dict[str, bytes] = {}
-    ctypes: dict[str, int]  = {}
+    files:  dict[str, bytes] = {}
+    ctypes: dict[str, int]   = {}
     with zipfile.ZipFile(song_path) as z:
         for info in z.infolist():
             ctypes[info.filename] = info.compress_type
@@ -371,13 +489,13 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Gain Staging Calculator  ·  VU Meter Mode")
-        self.geometry("1200x660")
-        self.minsize(900, 480)
-        self._results:      list[dict]       = []
-        self._sort_reverse: dict[str, bool]  = {}
-        self._song_path:    str | None       = None
-        self._song_tracks:  dict             = {}
-        self._auto_gate     = tk.BooleanVar(value=True)
+        self.geometry("1300x680")
+        self.minsize(960, 500)
+        self._results:      list[dict]      = []
+        self._sort_reverse: dict[str, bool] = {}
+        self._song_path:    str | None      = None
+        self._song_tracks:  dict            = {}
+        self._auto_gate = tk.BooleanVar(value=True)
         self._build_ui()
 
     # ── Layout ────────────────────────────────────────────────────────────────
@@ -390,9 +508,8 @@ class App(tk.Tk):
         self._folder = tk.StringVar()
         ttk.Entry(top, textvariable=self._folder, width=45).grid(
             row=0, column=1, columnspan=2, padx=4, sticky="ew")
-        ttk.Button(top, text="Browse…", command=self._browse_folder).grid(
+        ttk.Button(top, text="Browse...", command=self._browse_folder).grid(
             row=0, column=3, padx=(4, 0))
-
         self._recursive = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="Subfolders", variable=self._recursive).grid(
             row=0, column=4, padx=8)
@@ -407,21 +524,20 @@ class App(tk.Tk):
         self._song_info = ttk.Label(top, text="", foreground="gray")
         self._song_info.grid(row=1, column=4, padx=8, sticky="w", pady=(6, 0))
 
-        # ── Row 2: 파라미터 ───────────────────────────────────────────────────
+        # ── Row 2: 기본 파라미터 ──────────────────────────────────────────────
         ttk.Label(top, text="Gate:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self._gate = tk.DoubleVar(value=DEFAULT_GATE_DB)
         self._gate_spin = ttk.Spinbox(top, from_=-70, to=-10, increment=1,
-                    textvariable=self._gate, width=6)
+                                      textvariable=self._gate, width=6)
         self._gate_spin.grid(row=2, column=1, sticky="w", padx=4, pady=(6, 0))
-
         self._auto_gate_cb = ttk.Checkbutton(
             top, text="Auto", variable=self._auto_gate,
             command=self._on_auto_gate_toggle)
         self._auto_gate_cb.grid(row=2, column=1, sticky="e", pady=(6, 0))
-        self._on_auto_gate_toggle()   # 초기 상태 반영
+        self._on_auto_gate_toggle()
 
         ttk.Label(top, text="Target:").grid(row=2, column=2, sticky="e",
-                                             padx=(12, 4), pady=(6, 0))
+                                            padx=(12, 4), pady=(6, 0))
         self._target = tk.DoubleVar(value=DEFAULT_TARGET)
         ttk.Spinbox(top, from_=-30, to=-6, increment=0.5,
                     textvariable=self._target, width=6).grid(
@@ -433,9 +549,21 @@ class App(tk.Tk):
                     textvariable=self._percentile, width=5).grid(
             row=2, column=4, sticky="e", pady=(6, 0))
 
+        # ── Row 3: Peak-cap 헤드룸 ────────────────────────────────────────────
+        ttk.Label(top, text="Peak Headroom:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self._headroom = tk.DoubleVar(value=DEFAULT_HEADROOM)
+        ttk.Spinbox(top, from_=-12, to=0, increment=0.5,
+                    textvariable=self._headroom, width=6).grid(
+            row=3, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(
+            top,
+            text="dBFS  —  Peak Clip Risk 트랙에 한해 피크가 이 값을 넘지 않도록 게인을 제한",
+            foreground="gray",
+        ).grid(row=3, column=2, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+
         # ── Analyze / Write 버튼 ──────────────────────────────────────────────
         btn_frame = ttk.Frame(top)
-        btn_frame.grid(row=0, column=5, rowspan=3, padx=(16, 0), sticky="ns")
+        btn_frame.grid(row=0, column=5, rowspan=4, padx=(16, 0), sticky="ns")
         self._run_btn = ttk.Button(btn_frame, text="  Analyze  ", command=self._start)
         self._run_btn.pack(fill="x", pady=(0, 4))
         self._write_btn = ttk.Button(btn_frame, text="Write to .song",
@@ -466,8 +594,9 @@ class App(tk.Tk):
             ("valid",  "Valid (s)",     65, "center"),
             ("gate",   "Gate (dBFS)",   85, "center"),
             ("level",  "Level (dBFS)",  95, "center"),
-            ("offset", "Offset (dB)",   90, "center"),
-            ("gain",   "New Gain",      88, "center"),
+            ("peak",   "Peak (dBFS)",   90, "center"),
+            ("offset", "VU Offset",     85, "center"),
+            ("gain",   "New Gain",      95, "center"),
             ("status", "Status",       140, "center"),
         )
         self._tree = ttk.Treeview(
@@ -483,6 +612,7 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
 
         self._tree.tag_configure("ok",      foreground="#1a6b1a")
+        self._tree.tag_configure("capped",  foreground="#8b6914")
         self._tree.tag_configure("warn",    foreground="#b84000")
         self._tree.tag_configure("none",    foreground="#888888")
         self._tree.tag_configure("err",     foreground="#cc0000")
@@ -495,8 +625,8 @@ class App(tk.Tk):
         ttk.Button(bot, text="Clear",      command=self._clear ).pack(side="left", padx=8)
         ttk.Label(
             bot,
-            text="Ch: 오디오 특성 자동 감지  │  스테레오는 큰 채널 기준 측정  │"
-                 "  ⚠ = 클리핑 위험  │  Write to .song 은 Studio One 닫은 후 실행",
+            text="Green = OK  |  Gold = Peak-capped (VU 제한됨)  |"
+                 "  Write to .song 은 Studio One 닫은 후 실행",
             foreground="gray",
         ).pack(side="right")
 
@@ -510,7 +640,7 @@ class App(tk.Tk):
         items = [(self._tree.set(k, col), k) for k in self._tree.get_children()]
         rev   = self._sort_reverse.get(col, False)
         try:
-            items.sort(key=lambda t: float(t[0].replace("+", "")), reverse=rev)
+            items.sort(key=lambda t: float(t[0].replace("+", "").split()[0]), reverse=rev)
         except ValueError:
             items.sort(reverse=rev)
         for idx, (_, k) in enumerate(items):
@@ -581,7 +711,8 @@ class App(tk.Tk):
 
         for lbl in missing:
             self._tree.insert("", "end",
-                values=(lbl, "—", "—", "— WAV not found —", "", "", "", "", "", ""),
+                values=(lbl, "—", "—", "— WAV not found —",
+                        "", "", "", "", "", "", "", ""),
                 tags=("nomatch",))
 
         threading.Thread(
@@ -593,6 +724,7 @@ class App(tk.Tk):
         target    = self._target.get()
         pct       = self._percentile.get()
         auto_gate = self._auto_gate.get()
+        headroom  = self._headroom.get()
         n         = len(files)
 
         for i, (label, fp) in enumerate(files):
@@ -600,6 +732,7 @@ class App(tk.Tk):
             result             = analyze_file(str(fp), gate, target, pct, auto_gate=auto_gate)
             result["label"]    = label
             result["wav_path"] = str(fp)
+            result["headroom"] = headroom
             self._results.append(result)
             self.after(0, self._add_row, result)
             self.after(0, self._pct.set, (i + 1) / n * 100)
@@ -616,6 +749,24 @@ class App(tk.Tk):
         ):
             self._write_btn.config(state="normal")
 
+    # ── Peak-cap helper ───────────────────────────────────────────────────────
+    @staticmethod
+    def _calc_effective_gain(r: dict) -> tuple[float, bool]:
+        """(effective_gain_db, was_peak_capped) 반환.
+
+        VU 게인을 그대로 적용하면 peak_db + vu_gain > headroom 이 되는 경우,
+        peak_db + effective_gain == headroom 이 되도록 게인을 제한한다.
+        """
+        vu_gain  = r["offset_db"]
+        peak_db  = r.get("peak_db")
+        headroom = r.get("headroom", DEFAULT_HEADROOM)
+        if peak_db is not None and r.get("warning"):
+            safe = headroom - peak_db
+            if safe < vu_gain:
+                return safe, True
+        return vu_gain, False
+
+    # ── Table row ─────────────────────────────────────────────────────────────
     def _add_row(self, r: dict) -> None:
         label    = r.get("label") or "—"
         wav_name = Path(r.get("wav_path", r.get("file", "?"))).name
@@ -625,37 +776,37 @@ class App(tk.Tk):
         if "error" in r:
             self._tree.insert("", "end",
                 values=(label, ch_str, type_str, wav_name,
-                        "—", "—", "—", "ERROR", "—", "—", r["error"]),
+                        "—", "—", "—", "ERROR", "—", "—", "—", r["error"]),
                 tags=("err",))
             return
 
-        level    = f"{r['level_db']:.1f}"    if r["level_db"] is not None else "N/A"
-        offset   = f"{r['offset_db']:+.1f}"  if r["status"] != "No Signal" else "—"
-        gate_str = f"{r['gate_used']:.1f}"   if "gate_used" in r else "—"
+        level    = f"{r['level_db']:.1f}"  if r["level_db"] is not None else "N/A"
+        peak_str = f"{r['peak_db']:.1f}"   if r.get("peak_db") is not None else "—"
+        offset   = f"{r['offset_db']:+.1f}" if r["status"] != "No Signal" else "—"
+        gate_str = f"{r['gate_used']:.1f}" if "gate_used" in r else "—"
 
         if self._song_tracks and r.get("label") and r["status"] != "No Signal":
-            # WAV 분석값만 사용 — 기존 .song gain 누적 금지
-            gain_str = f"{r['offset_db']:+.2f} dB"
+            eff_gain, capped = self._calc_effective_gain(r)
+            if capped:
+                gain_str   = f"{eff_gain:+.2f} dB  (cap)"
+                status_str = "Peak-capped"
+                tag        = "capped"
+            else:
+                gain_str   = f"{eff_gain:+.2f} dB"
+                status_str = r["status"]
+                tag        = "ok"
         else:
-            gain_str = "—"
-
-        tag = ("warn" if r["warning"]
-               else "none" if r["status"] == "No Signal"
-               else "ok")
+            gain_str   = "—"
+            status_str = r["status"]
+            tag        = "none" if r["status"] == "No Signal" else "ok"
 
         self._tree.insert("", "end",
             values=(
-                label,
-                ch_str,
-                type_str,
-                wav_name,
+                label, ch_str, type_str, wav_name,
                 f"{r['duration']:.1f}",
                 f"{r['valid_duration']:.1f}",
-                gate_str,
-                level,
-                offset,
-                gain_str,
-                r["status"],
+                gate_str, level, peak_str, offset,
+                gain_str, status_str,
             ),
             tags=(tag,))
 
@@ -664,27 +815,35 @@ class App(tk.Tk):
         if not self._song_path:
             return
 
-        gain_map: dict[str, float] = {}
+        gain_map:    dict[str, float] = {}
+        capped_list: list[str]        = []
+
         for r in self._results:
             if "error" in r or r["status"] == "No Signal":
                 continue
             label = r.get("label")
             if not label:
                 continue
-            # WAV 분석값만 사용 — 기존 .song gain 누적 금지
-            gain_map[label] = r["offset_db"]
+            eff_gain, capped = self._calc_effective_gain(r)
+            gain_map[label] = eff_gain
+            if capped:
+                capped_list.append(label)
 
         if not gain_map:
             messagebox.showinfo("없음", "적용할 트랙이 없습니다.")
             return
 
         lines = "\n".join(
-            f"  {lbl:25s}  {g:+.2f} dB"
+            f"  {'[cap] ' if lbl in capped_list else '      '}{lbl:25s}  {g:+.2f} dB"
             for lbl, g in gain_map.items()
+        )
+        cap_note = (
+            f"\n\n[cap] 표시 {len(capped_list)}개 트랙: VU 게인이 Peak Headroom 초과 → 자동 제한됨"
+            if capped_list else ""
         )
         if not messagebox.askyesno(
             "확인",
-            f"아래 게인을 .song 파일에 적용합니다:\n\n{lines}\n\n"
+            f"아래 게인을 .song 파일에 적용합니다:\n\n{lines}{cap_note}\n\n"
             f".song.bak 백업이 자동 생성됩니다.\n\n계속하시겠습니까?"
         ):
             return
@@ -709,21 +868,27 @@ class App(tk.Tk):
             w = csv.writer(f)
             w.writerow(["S1 Track", "Ch", "Type", "WAV File",
                         "Total (s)", "Valid (s)", "Gate (dBFS)",
-                        "Level (dBFS)", "Offset (dB)", "Status"])
+                        "Level (dBFS)", "Peak (dBFS)", "VU Offset (dB)",
+                        "New Gain (dB)", "Status"])
             for r in self._results:
                 label = r.get("label") or "—"
                 wav   = Path(r.get("wav_path", r.get("file", "?"))).name
                 ch    = r.get("stereo_info", "?")
                 typ   = r.get("track_type", "Other")
                 gate  = f"{r['gate_used']:.1f}" if "gate_used" in r else "—"
+                pk    = f"{r['peak_db']:.2f}" if r.get("peak_db") is not None else "—"
                 if "error" in r:
-                    w.writerow([label, ch, typ, wav, "—", "—", "—", "ERROR", "—", r["error"]])
+                    w.writerow([label, ch, typ, wav,
+                                "—", "—", "—", "ERROR", "—", "—", "—", r["error"]])
                 else:
-                    lv  = f"{r['level_db']:.2f}" if r["level_db"] is not None else "N/A"
-                    off = f"{r['offset_db']:+.2f}" if r["status"] != "No Signal" else "0.00"
+                    lv       = f"{r['level_db']:.2f}" if r["level_db"] is not None else "N/A"
+                    off      = f"{r['offset_db']:+.2f}" if r["status"] != "No Signal" else "0.00"
+                    eff, cap = self._calc_effective_gain(r)
+                    eff_str  = f"{eff:+.2f}" if r["status"] != "No Signal" else "0.00"
+                    status   = "Peak-capped" if cap else r["status"]
                     w.writerow([label, ch, typ, wav,
                                 f"{r['duration']:.2f}", f"{r['valid_duration']:.2f}",
-                                gate, lv, off, r["status"]])
+                                gate, lv, pk, off, eff_str, status])
         messagebox.showinfo("저장", f"CSV 저장:\n{out}")
 
     # ── Clear ─────────────────────────────────────────────────────────────────
