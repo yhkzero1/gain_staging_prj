@@ -55,6 +55,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 
+VERSION = "1.0.0"
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 VU_TAU_MS        = 300    # ms — noise gate block size
 HOLD_BLOCKS      = 2      # gate hold (blocks)
@@ -488,7 +490,7 @@ def apply_gains_to_song(song_path: str, gain_map: dict[str, float]) -> str:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Gain Staging Calculator  ·  VU Meter Mode")
+        self.title(f"Gain Staging Calculator  ·  VU Meter Mode  v{VERSION}")
         self.geometry("1300x680")
         self.minsize(960, 500)
         self._results:      list[dict]      = []
